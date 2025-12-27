@@ -38,6 +38,7 @@ import org.apache.dubbo.config.annotation.Service;
 import org.apache.dubbo.config.invoker.DelegateProviderMetaDataInvoker;
 import org.apache.dubbo.config.support.Parameter;
 import org.apache.dubbo.config.utils.ConfigValidationUtils;
+import org.apache.dubbo.config.utils.MethodConfigUtils;
 import org.apache.dubbo.metadata.ServiceNameMapping;
 import org.apache.dubbo.metrics.event.MetricsEventBus;
 import org.apache.dubbo.metrics.event.MetricsInitEvent;
@@ -64,16 +65,22 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Queue;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 
 import static org.apache.dubbo.common.constants.CommonConstants.ANYHOST_KEY;
 import static org.apache.dubbo.common.constants.CommonConstants.ANY_VALUE;
@@ -154,19 +161,17 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
      */
     private transient volatile boolean unexported;
 
-    private transient volatile AtomicBoolean initialized = new AtomicBoolean(false);
+    private transient boolean methodsResolved = false;
 
+    private final transient AtomicBoolean initialized = new AtomicBoolean(false);
+
+    private final ConcurrentMap<String, Pattern> patternCache = new ConcurrentHashMap<>();
     /**
      * The exported services
      */
     private final ConcurrentHashMap<RegisterTypeEnum, List<Exporter<?>>> exporters = new ConcurrentHashMap<>();
 
     private final List<ServiceListener> serviceListeners = new ArrayList<>();
-
-    /**
-     * Whether to expose methods in this service as MCP tools, default value is false
-     */
-    private boolean mcpEnabled = false;
 
     public ServiceConfig() {}
 
@@ -199,15 +204,6 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
     @Parameter(excluded = true, attribute = false)
     public boolean isUnexported() {
         return unexported;
-    }
-
-    @Parameter(attribute = false, key = "mcp.enabled")
-    public boolean isMcpEnabled() {
-        return mcpEnabled;
-    }
-
-    public void setMcpEnabled(boolean mcpEnabled) {
-        this.mcpEnabled = mcpEnabled;
     }
 
     @Override
@@ -522,6 +518,9 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
             checkRef();
             generic = Boolean.FALSE.toString();
         }
+
+        computeEffectiveMethodConfigs();
+
         if (local != null) {
             if ("true".equals(local)) {
                 local = interfaceName + "Local";
@@ -578,7 +577,7 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
         exported();
     }
 
-    @SuppressWarnings({"unchecked", "rawtypes"})
+    @SuppressWarnings({"rawtypes"})
     private void doExportUrls(RegisterTypeEnum registerType) {
         ModuleServiceRepository repository = getScopeModel().getServiceRepository();
         ServiceDescriptor serviceDescriptor;
@@ -756,6 +755,21 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
     }
 
     private void appendParametersWithMethod(MethodConfig method, Map<String, String> params) {
+
+        Method matchedMethod = findMatchedMethod(method);
+        if (matchedMethod == null) {
+            throw new IllegalArgumentException("Method config refers to unknown method: " + method.getName());
+        }
+
+        List<ArgumentConfig> arguments = method.getArguments();
+        if (CollectionUtils.isNotEmpty(arguments)) {
+            for (ArgumentConfig arg : arguments) {
+                if (arg.getIndex() == -1 && StringUtils.isEmpty(arg.getType())) {
+                    throw new IllegalArgumentException("Argument config must set index or type attribute");
+                }
+            }
+        }
+
         AbstractConfig.appendParameters(params, method, method.getName());
 
         String retryKey = method.getName() + ".retry";
@@ -766,12 +780,8 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
             }
         }
 
-        List<ArgumentConfig> arguments = method.getArguments();
         if (CollectionUtils.isNotEmpty(arguments)) {
-            Method matchedMethod = findMatchedMethod(method);
-            if (matchedMethod != null) {
-                arguments.forEach(argument -> appendArgumentConfig(argument, matchedMethod, params));
-            }
+            arguments.forEach(arg -> appendArgumentConfig(arg, matchedMethod, params));
         }
     }
 
@@ -917,12 +927,16 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
                             MetadataUtils.publishServiceDefinition(
                                     localUrl, providerModel.getServiceModel(), getApplicationModel());
                         }
-                        this.urls.add(localUrl);
+                        if (!this.urls.contains(localUrl)) {
+                            this.urls.add(localUrl);
+                        }
                     }
                 }
             }
         }
-        this.urls.add(url);
+        if (!this.urls.contains(url)) {
+            this.urls.add(url);
+        }
     }
 
     private URL exportRemote(URL url, List<URL> registryURLs, RegisterTypeEnum registerType) {
@@ -990,7 +1004,8 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
             invoker = new DelegateProviderMetaDataInvoker(invoker, this);
         }
         Exporter<?> exporter = protocolSPI.export(invoker);
-        ConcurrentHashMapUtils.computeIfAbsent(exporters, registerType, k -> new CopyOnWriteArrayList<>())
+        Objects.requireNonNull(ConcurrentHashMapUtils.computeIfAbsent(
+                        exporters, registerType, k -> new CopyOnWriteArrayList<>()))
                 .add(exporter);
     }
 
@@ -1024,11 +1039,8 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
         List<ConfigPostProcessor> configPostProcessors = this.getExtensionLoader(ConfigPostProcessor.class)
                 .getActivateExtension(URL.valueOf("configPostProcessor://", getScopeModel()), (String[]) null);
 
-        HashSet<ConfigPostProcessor> allConfigPostProcessor = new HashSet<>();
-
         // merge common and old config
-        allConfigPostProcessor.addAll(configPostProcessors);
-        allConfigPostProcessor.addAll(configPostProcessors);
+        HashSet<ConfigPostProcessor> allConfigPostProcessor = new HashSet<>(configPostProcessors);
 
         allConfigPostProcessor.forEach(component -> component.postProcessServiceConfig(this));
     }
@@ -1198,5 +1210,242 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
     @Transient
     public Runnable getDestroyRunner() {
         return this::unexport;
+    }
+
+    private void computeEffectiveMethodConfigs() {
+        if (this.methods != null && this.isRefreshed() && this.methodsResolved) {
+            return;
+        }
+
+        if (interfaceClass == null) {
+            return;
+        }
+
+        Map<String, MethodCandidate> candidatesBySignature = new HashMap<>();
+        Set<String> interfaceSignatures = new HashSet<>();
+        for (java.lang.reflect.Method m : interfaceClass.getMethods()) {
+            interfaceSignatures.add(getMethodSignature(m));
+        }
+
+        Set<Class<?>> processedInterfaces = new HashSet<>();
+        Queue<Class<?>> interfaceQueue = new LinkedList<>();
+        interfaceQueue.add(interfaceClass);
+
+        while (!interfaceQueue.isEmpty()) {
+            Class<?> iface = interfaceQueue.poll();
+            if (iface != null && processedInterfaces.add(iface)) {
+                resolveCandidates(iface, interfaceSignatures, candidatesBySignature, 10);
+                Collections.addAll(interfaceQueue, iface.getInterfaces());
+            }
+        }
+
+        if (ref != null) {
+            Class<?> currentClass = ref.getClass();
+            List<Class<?>> hierarchy = new ArrayList<>();
+            while (currentClass != null && currentClass != Object.class) {
+                hierarchy.add(currentClass);
+                currentClass = currentClass.getSuperclass();
+            }
+
+            for (Class<?> clazz : hierarchy) {
+                resolveCandidates(clazz, interfaceSignatures, candidatesBySignature, 100);
+            }
+        }
+
+        if (this.getMethods() != null && !this.getMethods().isEmpty()) {
+            resolveServiceLevelConfigs(this.getMethods(), candidatesBySignature);
+        }
+
+        Map<String, MethodConfig> byName = new HashMap<>();
+
+        for (MethodCandidate candidate : candidatesBySignature.values()) {
+            byName.merge(candidate.methodName, candidate.config, (oldCfg, newCfg) -> {
+                mergeInto(oldCfg, newCfg);
+                return oldCfg;
+            });
+        }
+
+        this.methods = new ArrayList<>(byName.values());
+
+        for (MethodConfig method : this.methods) {
+            if (!method.isRefreshed()) {
+                method.refresh();
+            }
+        }
+
+        this.methodsResolved = true;
+    }
+
+    private void resolveCandidates(
+            Class<?> clazz,
+            Set<String> interfaceSignatures,
+            Map<String, MethodCandidate> candidatesBySignature,
+            int basePriority) {
+
+        for (java.lang.reflect.Method method : clazz.getDeclaredMethods()) {
+            if (method.isBridge() || method.isSynthetic()) {
+                continue;
+            }
+
+            String signature = getMethodSignature(method);
+            if (interfaceSignatures != null && !interfaceSignatures.contains(signature)) {
+                continue;
+            }
+
+            String key = method.getName();
+
+            org.apache.dubbo.config.annotation.Method annotation =
+                    method.getAnnotation(org.apache.dubbo.config.annotation.Method.class);
+            if (annotation != null) {
+                MethodConfig newConfig = MethodConfigUtils.createFromAnnotation(annotation, method.getName());
+
+                if (!newConfig.isRefreshed()) {
+                    newConfig.refresh();
+                }
+
+                updateBestCandidate(candidatesBySignature, signature, newConfig, basePriority);
+            }
+        }
+    }
+
+    private void resolveServiceLevelConfigs(
+            List<MethodConfig> serviceConfigs, Map<String, MethodCandidate> candidatesBySignature) {
+
+        for (MethodConfig cfg : serviceConfigs) {
+            String pattern = cfg.getName();
+            if (StringUtils.isEmpty(pattern)) {
+                continue;
+            }
+
+            boolean isWildcard = pattern.contains("*") || pattern.contains("?");
+            Pattern regex = isWildcard ? getCachedPattern(pattern) : null;
+
+            for (Method method : interfaceClass.getMethods()) {
+                boolean match = false;
+                int score = 200;
+
+                if (isWildcard) {
+                    if (regex.matcher(method.getName()).matches()) {
+                        match = true;
+                        score += pattern.length();
+                    }
+                } else {
+                    if (method.getName().equals(pattern)) {
+                        match = true;
+                        score += 1000;
+                    }
+                }
+
+                if (!match) {
+                    continue;
+                }
+
+                String key = method.getName();
+
+                MethodCandidate existing = candidatesBySignature.get(key);
+                MethodConfig target;
+
+                if (existing != null) {
+                    target = existing.config;
+                    mergeInto(target, cfg);
+                } else {
+                    target = new MethodConfig();
+                    mergeInto(target, cfg);
+                    target.setName(method.getName());
+                }
+
+                updateBestCandidate(candidatesBySignature, key, target, score);
+            }
+        }
+    }
+
+    private Pattern getCachedPattern(String pattern) {
+        return patternCache.computeIfAbsent(pattern, k -> {
+            StringBuilder regex = new StringBuilder("^");
+
+            for (int i = 0; i < k.length(); i++) {
+                char c = k.charAt(i);
+                switch (c) {
+                    case '*':
+                        regex.append(".*");
+                        break;
+                    case '?':
+                        regex.append(".");
+                        break;
+                    default:
+                        if ("\\.[]{}()+-^$|".indexOf(c) >= 0) {
+                            regex.append("\\");
+                        }
+                        regex.append(c);
+                }
+            }
+
+            regex.append("$");
+            return Pattern.compile(regex.toString());
+        });
+    }
+
+    private void updateBestCandidate(
+            Map<String, MethodCandidate> candidates, String methodName, MethodConfig config, int priority) {
+
+        MethodCandidate current = candidates.get(methodName);
+        if (current == null || priority > current.priority) {
+            candidates.put(methodName, new MethodCandidate(methodName, config, priority));
+        }
+    }
+
+    private void mergeInto(MethodConfig target, MethodConfig source) {
+        if (source == null) return;
+        if (source.getTimeout() != null && source.getTimeout() != -1) target.setTimeout(source.getTimeout());
+        if (source.getRetries() != null && source.getRetries() != -1) target.setRetries(source.getRetries());
+        if (source.getActives() != null && source.getActives() != -1) target.setActives(source.getActives());
+        if (source.getExecutes() != null && source.getExecutes() != -1) target.setExecutes(source.getExecutes());
+
+        if (StringUtils.isNotEmpty(source.getLoadbalance())) target.setLoadbalance(source.getLoadbalance());
+        if (StringUtils.isNotEmpty((String) source.getOninvoke())) target.setOninvoke(source.getOninvoke());
+        if (StringUtils.isNotEmpty((String) source.getOnreturn())) target.setOnreturn(source.getOnreturn());
+        if (StringUtils.isNotEmpty((String) source.getOnthrow())) target.setOnthrow(source.getOnthrow());
+        if (StringUtils.isNotEmpty(source.getCache())) target.setCache(source.getCache());
+        if (StringUtils.isNotEmpty(source.getValidation())) target.setValidation(source.getValidation());
+
+        if (source.isAsync() != null) target.setAsync(source.isAsync());
+        if (source.isReturn() != null) target.setReturn(source.isReturn());
+        if (source.getSent() != null) target.setSent(source.getSent());
+        if (source.getSticky() != null) target.setSticky(source.getSticky());
+
+        if (source.getParameters() != null) {
+            Map<String, String> params = target.getParameters();
+            if (params == null) {
+                target.setParameters(source.getParameters());
+            } else {
+                params.putAll(source.getParameters());
+            }
+        }
+    }
+
+    private static class MethodCandidate {
+        final String methodName;
+        final MethodConfig config;
+        final int priority;
+
+        MethodCandidate(String name, MethodConfig cfg, int prio) {
+            this.methodName = name;
+            this.config = cfg;
+            this.priority = prio;
+        }
+    }
+
+    private String getMethodSignature(Method method) {
+        StringBuilder sb = new StringBuilder(method.getName());
+        sb.append("(");
+        Class<?>[] paramTypes = method.getParameterTypes();
+        for (int i = 0; i < paramTypes.length; i++) {
+            if (i > 0) {
+                sb.append(",");
+            }
+            sb.append(paramTypes[i].getName());
+        }
+        sb.append(")");
+        return sb.toString();
     }
 }

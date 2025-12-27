@@ -159,7 +159,7 @@ public abstract class AbstractInterfaceConfig extends AbstractMethodConfig {
     /**
      * Method-specific configuration.
      */
-    private List<MethodConfig> methods;
+    List<MethodConfig> methods;
 
     /**
      * Registry IDs for service registration (use this or registries, not both).

@@ -19,6 +19,8 @@ package org.apache.dubbo.config;
 import org.apache.dubbo.common.URL;
 import org.apache.dubbo.common.constants.CommonConstants;
 import org.apache.dubbo.common.extension.ExtensionLoader;
+import org.apache.dubbo.config.annotation.DubboService;
+import org.apache.dubbo.config.annotation.Method;
 import org.apache.dubbo.config.api.DemoService;
 import org.apache.dubbo.config.api.Greeting;
 import org.apache.dubbo.config.bootstrap.DubboBootstrap;
@@ -88,9 +90,9 @@ import static org.mockito.Mockito.withSettings;
 
 class ServiceConfigTest {
 
-    private Protocol protocolDelegate = Mockito.mock(Protocol.class);
-    private Registry registryDelegate = Mockito.mock(Registry.class);
-    private Exporter exporter = Mockito.mock(Exporter.class);
+    private final Protocol protocolDelegate = Mockito.mock(Protocol.class);
+    private final Registry registryDelegate = Mockito.mock(Registry.class);
+    private final Exporter exporter = Mockito.mock(Exporter.class);
     private ServiceConfig<DemoServiceImpl> service;
     private ServiceConfig<DemoServiceImpl> service2;
     private ServiceConfig<DemoServiceImpl> serviceWithoutRegistryConfig;
@@ -174,7 +176,7 @@ class ServiceConfigTest {
     }
 
     @Test
-    void testExport() throws Exception {
+    void testExport() {
         service.export();
 
         try {
@@ -223,7 +225,7 @@ class ServiceConfigTest {
     }
 
     @Test
-    void testProxy() throws Exception {
+    void testProxy() {
         service2.export();
 
         try {
@@ -259,7 +261,7 @@ class ServiceConfigTest {
     }
 
     @Test
-    void testUnexport() throws Exception {
+    void testUnexport() {
         System.setProperty(SHUTDOWN_WAIT_KEY, "0");
         try {
             service.export();
@@ -272,7 +274,7 @@ class ServiceConfigTest {
     }
 
     @Test
-    void testInterfaceClass() throws Exception {
+    void testInterfaceClass() {
         ServiceConfig<Greeting> service = new ServiceConfig<>();
         service.setInterface(Greeting.class.getName());
         service.setRef(Mockito.mock(Greeting.class));
@@ -283,7 +285,7 @@ class ServiceConfigTest {
     }
 
     @Test
-    void testInterface1() throws Exception {
+    void testInterface1() {
         Assertions.assertThrows(IllegalStateException.class, () -> {
             ProtocolConfig protocolConfig = new ProtocolConfig(CommonConstants.TRIPLE);
             ServiceConfig<DemoService> service = new ServiceConfig<>();
@@ -293,14 +295,14 @@ class ServiceConfigTest {
     }
 
     @Test
-    void testInterface2() throws Exception {
+    void testInterface2() {
         ServiceConfig<DemoService> service = new ServiceConfig<>();
         service.setInterface(DemoService.class);
         assertThat(service.getInterface(), equalTo(DemoService.class.getName()));
     }
 
     @Test
-    void testNoInterfaceSupport() throws Exception {
+    void testNoInterfaceSupport() {
         ProtocolConfig protocolConfig = new ProtocolConfig(CommonConstants.TRIPLE);
         protocolConfig.setNoInterfaceSupport(true);
         ServiceConfig<DemoService> service = new ServiceConfig<>();
@@ -310,7 +312,7 @@ class ServiceConfigTest {
     }
 
     @Test
-    void testProvider() throws Exception {
+    void testProvider() {
         ServiceConfig service = new ServiceConfig();
         ProviderConfig provider = new ProviderConfig();
         service.setProvider(provider);
@@ -318,7 +320,7 @@ class ServiceConfigTest {
     }
 
     @Test
-    void testGeneric1() throws Exception {
+    void testGeneric1() {
         ServiceConfig service = new ServiceConfig();
         service.setGeneric(GENERIC_SERIALIZATION_DEFAULT);
         assertThat(service.getGeneric(), equalTo(GENERIC_SERIALIZATION_DEFAULT));
@@ -329,7 +331,7 @@ class ServiceConfigTest {
     }
 
     @Test
-    void testGeneric2() throws Exception {
+    void testGeneric2() {
         Assertions.assertThrows(IllegalArgumentException.class, () -> {
             ServiceConfig service = new ServiceConfig();
             service.setGeneric("illegal");
@@ -351,7 +353,7 @@ class ServiceConfigTest {
     void testMetaData() {
         // test new instance
         ServiceConfig config = new ServiceConfig();
-        Map<String, String> metaData = config.getMetaData();
+        Map metaData = config.getMetaData();
         Assertions.assertEquals(0, metaData.size(), "Expect empty metadata but found: " + metaData);
 
         // test merged and override provider attributes
@@ -713,7 +715,6 @@ class ServiceConfigTest {
         ServiceConfig<DemoService> serviceConfig = new ServiceConfig<>(applicationModel.newModule());
         serviceConfig.exported();
         ScheduledExecutorService scheduledExecutorService = Mockito.spy(Executors.newScheduledThreadPool(1));
-        AtomicInteger count = new AtomicInteger(0);
         ServiceNameMapping serviceNameMapping = new ServiceNameMapping() {
             @Override
             public boolean map(URL url) {
@@ -779,6 +780,111 @@ class ServiceConfigTest {
             serviceConfig.toString();
         } catch (Throwable t) {
             Assertions.fail(t);
+        }
+    }
+
+    @DubboService(methods = {@Method(name = "hello", timeout = 1000)})
+    interface TimeoutTestService {
+
+        String hello(String name);
+    }
+
+    @DubboService(methods = {@Method(name = "hello", timeout = 5000)})
+    static class TimeoutTestServiceImpl implements TimeoutTestService {
+
+        @Override
+        public String hello(String name) {
+            return "Hello " + name;
+        }
+    }
+
+    @Test
+    void testAnnotationPriorityImplOverInterface() {
+        FrameworkModel frameworkModel = new FrameworkModel();
+        ApplicationModel applicationModel = frameworkModel.newApplication();
+        ApplicationConfig appConfig = new ApplicationConfig("priority-app");
+        applicationModel.getApplicationConfigManager().setApplication(appConfig);
+
+        ServiceConfig<TimeoutTestService> priorityService = new ServiceConfig<>(applicationModel.newModule());
+        priorityService.setRegistry(new RegistryConfig("N/A"));
+        priorityService.setProtocol(new ProtocolConfig("mockprotocol2"));
+        priorityService.setInterface(TimeoutTestService.class);
+        priorityService.setRef(new TimeoutTestServiceImpl());
+
+        priorityService.export();
+
+        try {
+            URL url = priorityService.getExportedUrls().get(0);
+            String methodTimeout = url.getMethodParameter("hello", "timeout");
+
+            Assertions.assertEquals(
+                    "5000", methodTimeout, "Implementation annotation should override Interface annotation");
+        } finally {
+            priorityService.unexport();
+            frameworkModel.destroy();
+        }
+    }
+
+    @Test
+    void testExplicitConfigOverAnnotation() {
+        FrameworkModel frameworkModel = new FrameworkModel();
+        ApplicationModel applicationModel = frameworkModel.newApplication();
+        ApplicationConfig appConfig = new ApplicationConfig("priority-app");
+        applicationModel.getApplicationConfigManager().setApplication(appConfig);
+
+        ServiceConfig<TimeoutTestService> priorityService = new ServiceConfig<>(applicationModel.newModule());
+        priorityService.setRegistry(new RegistryConfig("N/A"));
+        priorityService.setProtocol(new ProtocolConfig("mockprotocol2"));
+        priorityService.setInterface(TimeoutTestService.class);
+        priorityService.setRef(new TimeoutTestServiceImpl());
+
+        MethodConfig methodConfig = new MethodConfig();
+        methodConfig.setName("hello");
+        methodConfig.setTimeout(9999);
+        priorityService.setMethods(Collections.singletonList(methodConfig));
+
+        priorityService.export();
+
+        try {
+            URL url = priorityService.getExportedUrls().get(0);
+            String methodTimeout = url.getMethodParameter("hello", "timeout");
+
+            Assertions.assertEquals("9999", methodTimeout, "Explicit MethodConfig should override Annotations");
+        } finally {
+            priorityService.unexport();
+            frameworkModel.destroy();
+        }
+    }
+
+    @Test
+    void testWildcardMethodConfig() {
+        FrameworkModel frameworkModel = new FrameworkModel();
+        ApplicationModel applicationModel = frameworkModel.newApplication();
+        ApplicationConfig appConfig = new ApplicationConfig("priority-app");
+        applicationModel.getApplicationConfigManager().setApplication(appConfig);
+
+        ServiceConfig<TimeoutTestService> service = new ServiceConfig<>(applicationModel.newModule());
+        service.setRegistry(new RegistryConfig("N/A"));
+        service.setProtocol(new ProtocolConfig("mockprotocol2"));
+        service.setInterface(TimeoutTestService.class);
+        service.setRef(new TimeoutTestServiceImpl());
+
+        MethodConfig wildcard = new MethodConfig();
+        wildcard.setName("he*");
+        wildcard.setTimeout(3000);
+        service.setMethods(Collections.singletonList(wildcard));
+
+        service.export();
+        try {
+            URL url = service.getExportedUrls().get(0);
+
+            Assertions.assertEquals(
+                    "3000",
+                    url.getMethodParameter("hello", "timeout"),
+                    "Wildcard MethodConfig (3000) should override Implementation Annotation (5000)");
+        } finally {
+            service.unexport();
+            frameworkModel.destroy();
         }
     }
 }

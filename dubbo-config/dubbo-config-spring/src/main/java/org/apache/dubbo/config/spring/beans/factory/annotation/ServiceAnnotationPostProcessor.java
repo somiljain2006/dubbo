@@ -36,8 +36,8 @@ import org.apache.dubbo.config.spring.schema.AnnotationBeanDefinitionParser;
 import org.apache.dubbo.config.spring.util.DubboAnnotationUtils;
 import org.apache.dubbo.config.spring.util.ObjectUtils;
 import org.apache.dubbo.config.spring.util.SpringCompatUtils;
+import org.apache.dubbo.config.utils.MethodConfigUtils;
 
-import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -50,6 +50,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import org.jspecify.annotations.NonNull;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.MutablePropertyValues;
 import org.springframework.beans.factory.BeanClassLoaderAware;
@@ -161,18 +162,18 @@ public class ServiceAnnotationPostProcessor
     }
 
     @Override
-    public void afterPropertiesSet() throws Exception {
+    public void afterPropertiesSet() {
         this.resolvedPackagesToScan = resolvePackagesToScan(packagesToScan);
     }
 
     @Override
-    public void postProcessBeanDefinitionRegistry(BeanDefinitionRegistry registry) throws BeansException {
+    public void postProcessBeanDefinitionRegistry(@NonNull BeanDefinitionRegistry registry) throws BeansException {
         this.registry = registry;
         scanServiceBeans(resolvedPackagesToScan, registry);
     }
 
     @Override
-    public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) throws BeansException {
+    public void postProcessBeanFactory(@NonNull ConfigurableListableBeanFactory beanFactory) throws BeansException {
         if (this.registry == null) {
             // In spring 3.x, may be not call postProcessBeanDefinitionRegistry()
             this.registry = (BeanDefinitionRegistry) beanFactory;
@@ -282,8 +283,7 @@ public class ServiceAnnotationPostProcessor
     }
 
     /**
-     * It'd be better to use BeanNameGenerator instance that should reference
-     * {@link ConfigurationClassPostProcessor#componentScanBeanNameGenerator},
+     * It'd be better to use BeanNameGenerator instance that should reference,
      * thus it maybe a potential problem on bean name generation.
      *
      * @param registry {@link BeanDefinitionRegistry}
@@ -298,7 +298,7 @@ public class ServiceAnnotationPostProcessor
         BeanNameGenerator beanNameGenerator = null;
 
         if (registry instanceof SingletonBeanRegistry) {
-            SingletonBeanRegistry singletonBeanRegistry = SingletonBeanRegistry.class.cast(registry);
+            SingletonBeanRegistry singletonBeanRegistry = (SingletonBeanRegistry) registry;
             beanNameGenerator =
                     (BeanNameGenerator) singletonBeanRegistry.getSingleton(CONFIGURATION_BEAN_NAME_GENERATOR);
         }
@@ -372,8 +372,8 @@ public class ServiceAnnotationPostProcessor
         // ServiceBean Bean name
         String beanName = generateServiceBeanName(serviceAnnotationAttributes, serviceInterface);
 
-        AbstractBeanDefinition serviceBeanDefinition =
-                buildServiceBeanDefinition(serviceAnnotationAttributes, serviceInterface, annotatedServiceBeanName);
+        AbstractBeanDefinition serviceBeanDefinition = buildServiceBeanDefinition(
+                beanClass, serviceAnnotationAttributes, serviceInterface, annotatedServiceBeanName);
 
         registerServiceBeanDefinition(beanName, serviceBeanDefinition, serviceInterface);
     }
@@ -427,6 +427,7 @@ public class ServiceAnnotationPostProcessor
 
         String beanClassName = beanDefinition.getBeanClassName();
 
+        assert beanClassName != null;
         return resolveClassName(beanClassName, classLoader);
     }
 
@@ -451,7 +452,10 @@ public class ServiceAnnotationPostProcessor
      * @since 2.7.3
      */
     private AbstractBeanDefinition buildServiceBeanDefinition(
-            Map<String, Object> serviceAnnotationAttributes, String serviceInterface, String refServiceBeanName) {
+            Class<?> beanClass,
+            Map<String, Object> serviceAnnotationAttributes,
+            String serviceInterface,
+            String refServiceBeanName) {
 
         BeanDefinitionBuilder builder = rootBeanDefinition(ServiceBean.class);
 
@@ -485,21 +489,24 @@ public class ServiceAnnotationPostProcessor
         builder.addPropertyValue("parameters", DubboAnnotationUtils.convertParameters((String[])
                 serviceAnnotationAttributes.get("parameters")));
         // Add methods parameters
-        List<MethodConfig> methodConfigs = convertMethodConfigs(serviceAnnotationAttributes.get("methods"));
-        if (!methodConfigs.isEmpty()) {
+        List rawServiceLevelConfigs = convertMethodConfigs(serviceAnnotationAttributes.get("methods"));
+        // Call the new scanning/merging logic
+        List finalMethodConfigs = scanAndMergeMethodConfigs(rawServiceLevelConfigs);
+
+        if (!finalMethodConfigs.isEmpty()) {
             if (AotWithSpringDetector.isAotProcessing()) {
                 List<String> methodsJson = new ArrayList<>();
-                methodConfigs.forEach(methodConfig -> methodsJson.add(JsonUtils.toJson(methodConfig)));
+                finalMethodConfigs.forEach(methodConfig -> methodsJson.add(JsonUtils.toJson(methodConfig)));
                 builder.addPropertyValue("methodsJson", methodsJson);
             } else {
-                builder.addPropertyValue("methods", methodConfigs);
+                builder.addPropertyValue("methods", finalMethodConfigs);
             }
         }
 
         // convert provider to providerIds
         String providerConfigId = (String) serviceAnnotationAttributes.get("provider");
         if (StringUtils.hasText(providerConfigId)) {
-            addPropertyValue(builder, "providerIds", providerConfigId);
+            addPropertyValue(builder, providerConfigId);
         }
 
         // Convert registry[] to registryIds
@@ -540,21 +547,30 @@ public class ServiceAnnotationPostProcessor
         return builder.getBeanDefinition();
     }
 
-    private String[] resolveStringArray(String[] strs) {
+    private void resolveStringArray(String[] strs) {
         if (strs == null) {
-            return null;
+            return;
         }
         for (int i = 0; i < strs.length; i++) {
             strs[i] = environment.resolvePlaceholders(strs[i]);
         }
-        return strs;
     }
 
-    private List convertMethodConfigs(Object methodsAnnotation) {
+    // Replace the existing convertMethodConfigs with this:
+    private List<MethodConfig> convertMethodConfigs(Object methodsAnnotation) {
         if (methodsAnnotation == null) {
-            return Collections.EMPTY_LIST;
+            return Collections.emptyList();
         }
-        return MethodConfig.constructMethodConfig((Method[]) methodsAnnotation);
+
+        Method[] methods = (Method[]) methodsAnnotation;
+        List<MethodConfig> result = new ArrayList<>(methods.length);
+
+        for (Method methodAnnotation : methods) {
+            // ✅ CORRECT: Uses the shared utility
+            result.add(MethodConfigUtils.createFromAnnotation(methodAnnotation, methodAnnotation.name()));
+        }
+
+        return result;
     }
 
     private void addPropertyReference(BeanDefinitionBuilder builder, String propertyName, String beanName) {
@@ -562,9 +578,9 @@ public class ServiceAnnotationPostProcessor
         builder.addPropertyReference(propertyName, resolvedBeanName);
     }
 
-    private void addPropertyValue(BeanDefinitionBuilder builder, String propertyName, String value) {
+    private void addPropertyValue(BeanDefinitionBuilder builder, String value) {
         String resolvedBeanName = environment.resolvePlaceholders(value);
-        builder.addPropertyValue(propertyName, resolvedBeanName);
+        builder.addPropertyValue("providerIds", resolvedBeanName);
     }
 
     /**
@@ -586,6 +602,7 @@ public class ServiceAnnotationPostProcessor
                         // Compatible with Spring 4.x
                         Map<String, Object> annotationAttributes =
                                 factoryMethodMetadata.getAnnotationAttributes(annotationType.getName());
+                        assert annotationAttributes != null;
                         return filterDefaultValues(annotationType, annotationAttributes);
                     }
                 }
@@ -622,6 +639,7 @@ public class ServiceAnnotationPostProcessor
 
         // get bean class from return type
         String returnTypeName = SpringCompatUtils.getFactoryMethodReturnType(refServiceBeanDefinition);
+        assert returnTypeName != null;
         Class<?> beanClass = resolveClassName(returnTypeName, classLoader);
 
         String serviceInterface = resolveInterfaceName(serviceAnnotationAttributes, beanClass);
@@ -629,8 +647,8 @@ public class ServiceAnnotationPostProcessor
         // ServiceBean Bean name
         String serviceBeanName = generateServiceBeanName(serviceAnnotationAttributes, serviceInterface);
 
-        AbstractBeanDefinition serviceBeanDefinition =
-                buildServiceBeanDefinition(serviceAnnotationAttributes, serviceInterface, refServiceBeanName);
+        AbstractBeanDefinition serviceBeanDefinition = buildServiceBeanDefinition(
+                beanClass, serviceAnnotationAttributes, serviceInterface, refServiceBeanName);
 
         // set id
         serviceBeanDefinition.getPropertyValues().add(Constants.ID, serviceBeanName);
@@ -663,17 +681,17 @@ public class ServiceAnnotationPostProcessor
     }
 
     @Override
-    public void setEnvironment(Environment environment) {
+    public void setEnvironment(@NonNull Environment environment) {
         this.environment = environment;
     }
 
     @Override
-    public void setResourceLoader(ResourceLoader resourceLoader) {
+    public void setResourceLoader(@NonNull ResourceLoader resourceLoader) {
         this.resourceLoader = resourceLoader;
     }
 
     @Override
-    public void setBeanClassLoader(ClassLoader classLoader) {
+    public void setBeanClassLoader(@NonNull ClassLoader classLoader) {
         this.classLoader = classLoader;
     }
 
@@ -688,8 +706,7 @@ public class ServiceAnnotationPostProcessor
         private int excludedCount;
 
         @Override
-        public boolean match(MetadataReader metadataReader, MetadataReaderFactory metadataReaderFactory)
-                throws IOException {
+        public boolean match(MetadataReader metadataReader, @NonNull MetadataReaderFactory metadataReaderFactory) {
             String className = metadataReader.getClassMetadata().getClassName();
             boolean excluded = servicePackagesHolder.isClassScanned(className);
             if (excluded) {
@@ -701,5 +718,9 @@ public class ServiceAnnotationPostProcessor
         public int getExcludedCount() {
             return excludedCount;
         }
+    }
+
+    private List<MethodConfig> scanAndMergeMethodConfigs(List<MethodConfig> serviceLevelConfigs) {
+        return serviceLevelConfigs != null ? serviceLevelConfigs : new ArrayList<>();
     }
 }
